@@ -1,0 +1,136 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Automatic Support Case creation to enable Enterprise Support on new/invited AWS through organizations
+Parameters:
+  CompanyName:
+    Type: String
+    Description:  Enter your company name.  This is used when requesting Concierge to enable Enterprise Support of a new account
+  ccList:
+    Type: String
+    Description: Comma Separated list of e-mail addresses to CC on this case.  You MUST enter at least one e-mail address.
+Resources:
+  awsOrgEventSource:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Description: "Organization Invite or Create Account to add to Enterprise Support"
+      EventPattern:
+        source:
+          - "aws.organizations"
+        detail-type:
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventSource:
+            - "organizations.amazonaws.com"
+          eventName:
+            - "InviteAccountToOrganization"
+            - "CreateAccount"
+      State: "ENABLED"
+      Targets:
+        -
+          Arn: !GetAtt awsOrgLambdaFunction.Arn
+          Id: "OrgInvite"
+  awsOrgLambdaPermissions:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !Ref awsOrgLambdaFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt awsOrgEventSource.Arn
+  awsOrgLambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+  awsOrgLambdaPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: awsOrg
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: Allow
+            Action:
+            - support:*
+            - organizations:DescribeCreateAccountStatus
+            Resource: "*"
+          -
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: "arn:aws:logs:*:*:*"
+      Roles:
+        -
+          Ref: "awsOrgLambdaRole"
+  awsOrgLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt awsOrgLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import time
+          def lambda_handler(event, context):
+            client = boto3.client('support')
+            if event['detail']['eventName'] == "CreateAccount":
+              createAccountStatusID = event['detail']['responseElements']['createAccountStatus']['id']
+              print (createAccountStatusID)
+              org_client = boto3.client('organizations')
+              while True:
+                response = org_client.describe_create_account_status(
+                  CreateAccountRequestId=createAccountStatusID
+                  )
+                if response['CreateAccountStatus']['State'] == 'SUCCEEDED':
+                  newAccountID = response['CreateAccountStatus']['AccountId']
+                  break
+                elif response['CreateAccountStatus']['State'] == 'Failed':
+                  print ("Account Creation Failed")
+                  exit
+                else:
+                  print ("sleeping 5 seconds and will try again")
+                  time.sleep(5)
+            elif event['detail']['eventName'] == "InviteAccountToOrganization":
+              newAccountID = event['detail']['requestParameters']['target']['id']
+            companyName = os.environ['companyName']
+            caseSubject="Add new account to " + companyName +" Enterprise Support: " + newAccountID
+            caseSeverityCode='low'
+            caseCategoryCode='other-account-issues'
+            caseServiceCode='customer-account'
+            caseCommunicationBody = "Hi AWS, please add this account to Enterprise Support: " + newAccountID
+            ccList=os.environ['ccList']
+            caseIssueType='customer-service'
+            #Create Case
+            response = client.create_case(
+                subject= caseSubject,
+                severityCode=caseSeverityCode,
+                categoryCode=caseCategoryCode,
+                serviceCode=caseServiceCode,
+                communicationBody=caseCommunicationBody,
+                ccEmailAddresses=[ccList],
+                language='en',
+                issueType=caseIssueType
+                )
+            #Print Case ID to return
+            caseId = response['caseId']
+            case = client.describe_cases(
+                caseIdList=[caseId])
+            displayId = case['cases'][0]['displayId']
+            return ("Case " + displayId + " opened")
+      Runtime: "python3.6"
+      Timeout: "300"
+      Environment:
+        Variables:
+          companyName: !Ref "CompanyName"
+          ccList: !Ref "ccList"
